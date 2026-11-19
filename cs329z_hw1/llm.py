@@ -57,8 +57,12 @@ DEFAULT_MODELS = {
 # ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
+# Local adaptation: set LLM_PROVIDER=deepseek (or CS329Z_LM_PROVIDER) to call
+# DeepSeek's OpenAI-compatible API instead. Docs: https://api-docs.deepseek.com
+DEEPSEEK_URL = "https://api.deepseek.com"
+
 # Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
-# Override with CS329Z_REASONING_EFFORT.
+# Override with CS329Z_REASONING_EFFORT. OpenRouter only; not sent to DeepSeek.
 DEFAULT_REASONING_EFFORT = "low"
 
 # USD per 1M tokens: (input, cached input, output), keyed by the model name
@@ -85,6 +89,18 @@ PRICES = {
     "gpt-6-luna": (0.10, 0.01, 0.50),
     "gpt-6-sol": (2.00, 0.20, 10.00),
 }
+
+# CNY per 1M tokens for DeepSeek list prices (NOT USD). These are estimates
+# for the ledger: DeepSeek bills in CNY with peak/off-peak rates, and the
+# API does not return a dollar cost. We store cost_cny (estimated) and a
+# converted cost_usd (estimated) so CS329Z_BUDGET_USD still works.
+# Peak rates for deepseek-flash from https://api-docs.deepseek.com/quick_start/pricing
+# (cache-miss input / cache-hit input / output).
+PRICES_CNY = {
+    "deepseek-flash": (2.0, 0.04, 8.0),
+}
+
+DEFAULT_CNY_PER_USD = 7.2
 
 VALID_ROLES = ("system", "user", "assistant")
 
@@ -122,6 +138,22 @@ class OutputTruncated(RuntimeError):
         )
 
 
+def lm_provider() -> str:
+    """Return ``openrouter`` (default) or ``deepseek``.
+
+    Prefers ``LLM_PROVIDER``; falls back to ``CS329Z_LM_PROVIDER``.
+    """
+    raw = os.environ.get("LLM_PROVIDER") or os.environ.get("CS329Z_LM_PROVIDER") or "openrouter"
+    return raw.strip().lower() or "openrouter"
+
+
+def cny_per_usd() -> float:
+    raw = os.environ.get("CS329Z_CNY_PER_USD")
+    if raw:
+        return float(raw)
+    return DEFAULT_CNY_PER_USD
+
+
 def resolve_model(role_or_model: str | None = None) -> str:
     """Map a role ("grading", "user", "judge") to a model name.
 
@@ -130,22 +162,47 @@ def resolve_model(role_or_model: str | None = None) -> str:
     """
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
-        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", DEFAULT_MODELS[name])
+        env = os.environ.get(f"CS329Z_{name.upper()}_MODEL")
+        if env:
+            return env
+        if lm_provider() == "deepseek":
+            return "deepseek-flash"
+        return DEFAULT_MODELS[name]
     return name
 
 
-def _price(model: str) -> tuple[float, float, float]:
+def _lookup_price_row(model: str, table: dict[str, tuple[float, float, float]]) -> tuple[float, float, float] | None:
     model = model.rsplit("/", 1)[-1]  # "openai/gpt-6-luna" -> "gpt-6-luna"
     best = None
-    for prefix, price in PRICES.items():
-        if model == prefix or model.startswith(prefix + "-20"):
+    for prefix, price in table.items():
+        if model == prefix or model.startswith(prefix + "-") or model.startswith(prefix + "-20"):
             if best is None or len(prefix) > len(best[0]):
                 best = (prefix, price)
-    if best is None:
-        raise KeyError(
-            f"No price on file for model {model!r}. Add it to PRICES in cs329z_hw1/llm.py."
-        )
-    return best[1]
+    return None if best is None else best[1]
+
+
+def _price(model: str) -> tuple[float, float, float]:
+    """USD per 1M tokens (input, cached, output). CNY list prices are converted."""
+    usd = _lookup_price_row(model, PRICES)
+    if usd is not None:
+        return usd
+    cny = _lookup_price_row(model, PRICES_CNY)
+    if cny is not None:
+        rate = cny_per_usd()
+        return tuple(v / rate for v in cny)  # type: ignore[return-value]
+    raise KeyError(
+        f"No price on file for model {model!r}. Add it to PRICES or PRICES_CNY in cs329z_hw1/llm.py."
+    )
+
+
+def cost_cny(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float | None:
+    """Estimated CNY cost from PRICES_CNY, or None when the model is USD-only."""
+    row = _lookup_price_row(model, PRICES_CNY)
+    if row is None:
+        return None
+    p_in, p_cached, p_out = row
+    fresh = max(input_tokens - cached_tokens, 0)
+    return (fresh * p_in + cached_tokens * p_cached + output_tokens * p_out) / 1_000_000
 
 
 def cost_usd(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
@@ -279,27 +336,40 @@ class LM:
         start = time.time()
         text, usage = self._complete(messages)
         elapsed = time.time() - start
-        cost = usage.get("cost")
-        if cost is None:
+        # OpenRouter may return an exact USD cost; otherwise we estimate from
+        # the price tables. DeepSeek costs are estimated CNY (peak list rates)
+        # plus a converted USD figure for the budget stop — not the bill.
+        provider_cost = usage.get("cost")
+        estimated = not isinstance(provider_cost, (int, float))
+        if estimated:
             cost = cost_usd(self.model, usage["input"], usage["cached"], usage["output"])
+        else:
+            cost = float(provider_cost)
+        cny = usage.get("cost_cny")
+        if cny is None:
+            cny = cost_cny(self.model, usage["input"], usage["cached"], usage["output"])
         self.input_tokens += usage["input"]
         self.output_tokens += usage["output"]
         self.cost_usd += cost
         self.seconds += elapsed
         truncated = usage.get("finish_reason") == "length"
-        _append_ledger(
-            {
-                "ts": round(start, 3),
-                "model": self.model,
-                "tag": self.tag or os.environ.get("CS329Z_TAG", ""),
-                "input_tokens": usage["input"],
-                "cached_tokens": usage["cached"],
-                "output_tokens": usage["output"],
-                "cost_usd": cost,
-                "seconds": round(elapsed, 3),
-                "finish_reason": usage.get("finish_reason"),
-            }
-        )
+        row = {
+            "ts": round(start, 3),
+            "model": self.model,
+            "provider": lm_provider(),
+            "tag": self.tag or os.environ.get("CS329Z_TAG", ""),
+            "input_tokens": usage["input"],
+            "cached_tokens": usage["cached"],
+            "output_tokens": usage["output"],
+            "cost_usd": cost,
+            "cost_estimated": estimated,
+            "seconds": round(elapsed, 3),
+            "finish_reason": usage.get("finish_reason"),
+        }
+        if cny is not None:
+            row["cost_cny"] = cny
+            row["cost_cny_estimated"] = True
+        _append_ledger(row)
         if truncated:  # charged and logged, never cached
             raise OutputTruncated(
                 text,
@@ -332,7 +402,7 @@ class LM:
     def _key(self, messages: list[Message]) -> str:
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         blob = json.dumps(
-            [self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
+            [lm_provider(), self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -349,35 +419,65 @@ class LM:
                 "Raise the cap in .env if you mean to continue."
             )
 
-    def _complete(self, messages: list[Message]) -> tuple[str, dict]:
-        if self._client is None:
-            from openai import OpenAI
+    def _make_client(self):
+        from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+        provider = lm_provider()
+        if provider == "deepseek":
+            key = os.environ.get("DEEPSEEK_API_KEY")
             if not key:
                 raise RuntimeError(
-                    "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
+                    "DEEPSEEK_API_KEY is not set. Add your DeepSeek API key to .env."
                 )
-            self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+            base_url = os.environ.get("DEEPSEEK_BASE_URL", DEEPSEEK_URL)
+            return OpenAI(
+                base_url=base_url,
                 api_key=key,
                 max_retries=6,
                 timeout=120,
-                default_headers={"X-Title": "CS329Z HW1"},
             )
+        if provider != "openrouter":
+            raise RuntimeError(
+                f"Unknown LLM provider {provider!r}. Use LLM_PROVIDER=openrouter or deepseek."
+            )
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
+            )
+        return OpenAI(
+            base_url=OPENROUTER_URL,
+            api_key=key,
+            max_retries=6,
+            timeout=120,
+            default_headers={"X-Title": "CS329Z HW1"},
+        )
+
+    def _complete(self, messages: list[Message]) -> tuple[str, dict]:
+        if self._client is None:
+            self._client = self._make_client()
+        provider = lm_provider()
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            # OpenRouter extensions: the reasoning effort, and the request
-            # that the response carry the cost of the call.
-            "extra_body": {"usage": {"include": True}},
         }
+        if provider == "openrouter":
+            # OpenRouter-only extensions.
+            kwargs["extra_body"] = {"usage": {"include": True}}
+            effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+            if effort and self.model not in _NO_EFFORT:
+                kwargs["extra_body"]["reasoning"] = {"effort": effort}
+        elif provider == "deepseek":
+            # Thinking is on by default for deepseek-flash; disable so LM()
+            # returns plain assistant content (HW1 builds tools on text).
+            # Set DEEPSEEK_THINKING=enabled to turn it back on.
+            thinking = os.environ.get("DEEPSEEK_THINKING", "disabled").strip().lower()
+            if thinking not in {"enabled", "disabled"}:
+                thinking = "disabled"
+            kwargs["extra_body"] = {"thinking": {"type": thinking}}
         if self.model not in _NO_TEMPERATURE:
             kwargs["temperature"] = self.temperature
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
-        if effort and self.model not in _NO_EFFORT:
-            kwargs["extra_body"]["reasoning"] = {"effort": effort}
         try:
             response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # some models reject temperature or reasoning effort
@@ -386,7 +486,12 @@ class LM:
                 _NO_TEMPERATURE.add(self.model)
                 kwargs.pop("temperature")
                 response = self._client.chat.completions.create(**kwargs)
-            elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
+            elif (
+                provider == "openrouter"
+                and "reasoning" in text
+                and "extra_body" in kwargs
+                and "reasoning" in kwargs["extra_body"]
+            ):
                 _NO_EFFORT.add(self.model)
                 kwargs["extra_body"].pop("reasoning")
                 response = self._client.chat.completions.create(**kwargs)
@@ -395,18 +500,20 @@ class LM:
         choice = response.choices[0]
         text = choice.message.content or ""
         u = response.usage
+        if u is None:
+            raise RuntimeError(f"{self.model} returned no usage object; cannot meter the call.")
         details = getattr(u, "prompt_tokens_details", None)
         cached = getattr(details, "cached_tokens", 0) or 0
         out_details = getattr(u, "completion_tokens_details", None)
         reasoning = getattr(out_details, "reasoning_tokens", 0) or 0
         usage = {
-            "input": u.prompt_tokens,
+            "input": u.prompt_tokens or 0,
             "cached": cached,
-            "output": u.completion_tokens,
+            "output": u.completion_tokens or 0,
             "reasoning": reasoning,
             "finish_reason": getattr(choice, "finish_reason", None),
         }
-        cost = getattr(u, "cost", None)  # OpenRouter's figure for this call
+        cost = getattr(u, "cost", None)  # OpenRouter's figure for this call (USD)
         if isinstance(cost, (int, float)):
             usage["cost"] = float(cost)
         return text, usage
