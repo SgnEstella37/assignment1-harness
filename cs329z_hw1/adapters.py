@@ -181,7 +181,9 @@ def run_tool_registry(tools: list[ToolSpec]) -> Any:
       ``fn(**args)``: status "ok", ``content == str(return value)``.
     * The registry keeps working after any of these outcomes.
     """
-    raise NotImplementedError
+    from cs329z_hw1.agent.registry import build_registry
+
+    return build_registry(tools)
 
 
 def run_render_tools(schemas: list[dict]) -> str:
@@ -193,7 +195,9 @@ def run_render_tools(schemas: list[dict]) -> str:
     this text, the model must write a correct call for at least 18 of the 20
     requests in tests/fixtures/agent_protocol_requests.json.
     """
-    raise NotImplementedError
+    from cs329z_hw1.agent.protocol import render_tools
+
+    return render_tools(schemas)
 
 
 def run_parse_response(text: str) -> ParsedResponse:
@@ -213,7 +217,9 @@ def run_parse_response(text: str) -> ParsedResponse:
       is exactly the original call, never a different one. If the cut is
       inside the arguments, ``tool_call`` is None and ``error`` is set.
     """
-    raise NotImplementedError
+    from cs329z_hw1.agent.protocol import parse_response
+
+    return parse_response(text)
 
 
 def run_format_tool_call(text: str, call: ToolCall) -> str:
@@ -232,7 +238,9 @@ def run_format_tool_call(text: str, call: ToolCall) -> str:
       complete call in your own format.
     * ``call`` is not modified.
     """
-    raise NotImplementedError
+    from cs329z_hw1.agent.protocol import format_tool_call
+
+    return format_tool_call(text, call)
 
 
 def run_agent_session(
@@ -348,7 +356,9 @@ def run_agent_session(
     * Nothing in a tool result changes the mode, the approval policy or
       the deny rules.
     """
-    raise NotImplementedError
+    from cs329z_hw1.agent.session import create_session
+
+    return create_session(lm, tools, config)
 
 
 def run_build_doc_index(docs: list[dict]) -> Any:
@@ -361,7 +371,9 @@ def run_build_doc_index(docs: list[dict]) -> Any:
     it to both; your ``search_docs`` and ``read_doc`` tools should build it
     the first time a tool needs it and share it.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.docs import build_doc_index
+
+    return build_doc_index(docs)
 
 
 def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
@@ -378,7 +390,9 @@ def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
       document and its snippet contains the word.
     * The same call returns the same results every time.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.docs import search_docs
+
+    return search_docs(index, query, k)
 
 
 def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
@@ -397,4 +411,6 @@ def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
     * An unknown ``doc_id``, or a ``start_line`` outside
       ``1..total_lines``, raises ValueError or LookupError.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.docs import read_doc
+
+    return read_doc(index, doc_id, start_line)
